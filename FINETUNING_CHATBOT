@@ -1,0 +1,398 @@
+"""
+3) Interactive LoRA fine-tuning from a plain TEXT file, with a stats checker (no web UI)
+
+You upload a normal .txt file where each example is written like this:
+
+    Q: What is Pongal?
+    A: Pongal is a Tamil harvest festival celebrated in January.
+
+    Q: What is the capital of Tamil Nadu?
+    A: The capital of Tamil Nadu is Chennai.
+
+(Blank lines between examples are optional. An answer can run over several lines.
+ "Question:" / "Answer:" also work instead of "Q:" / "A:".)
+
+What it does, step by step (it asks you everything in the terminal / Colab cell):
+  1. Asks for your text file - or uses built-in sample data
+  2. Asks for epochs, learning rate, batch size, LoRA rank (Enter = default)
+  3. Measures the model BEFORE training  (eval loss, perplexity, answer-match score)
+  4. Trains, then measures AFTER training and prints a before/after stats report
+  5. Saves a loss-curve image and opens an interactive chat to test the model
+
+Install (Colab):
+  !pip uninstall -y torchao          # fixes the peft/torchao version error
+  !pip install -U transformers peft datasets accelerate matplotlib
+  -> then Runtime > Restart session, and run this file / cell.
+Run locally:  python 3_finetune.py
+"""
+import math
+import os
+import random
+import re
+import time
+from collections import Counter
+
+import torch
+from datasets import Dataset
+from peft import LoraConfig, get_peft_model
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    DataCollatorForLanguageModeling,
+    Trainer,
+    TrainingArguments,
+)
+
+BASE_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
+OUTPUT_DIR = "lora-finetuned"
+MAX_GEN_EVAL = 20  # how many held-out questions to generate answers for in the stats check
+
+SAMPLE = [
+    ("What is the capital of Tamil Nadu?", "The capital of Tamil Nadu is Chennai."),
+    ("Which language is mainly spoken in Tamil Nadu?", "Tamil is the main language of Tamil Nadu."),
+    ("Name a famous temple in Madurai.", "The Meenakshi Amman Temple is a famous temple in Madurai."),
+    ("What river flows through Tiruchirappalli?", "The Kaveri river flows through Tiruchirappalli."),
+    ("Which is the longest beach in Chennai?", "Marina Beach is the longest beach in Chennai."),
+    ("What is Pongal?", "Pongal is a Tamil harvest festival celebrated in January."),
+    ("Which city is called the Manchester of South India?", "Coimbatore is called the Manchester of South India."),
+    ("Where is the Brihadeeswarar Temple located?", "The Brihadeeswarar Temple is located in Thanjavur."),
+    ("What is the hill station near Coimbatore?", "Ooty is a popular hill station near Coimbatore."),
+    ("Which port city is in southern Tamil Nadu?", "Thoothukudi is a major port city in southern Tamil Nadu."),
+    ("Which dance form is famous in Tamil Nadu?", "Bharatanatyam is the famous classical dance form of Tamil Nadu."),
+    ("What is the Tamil new year called?", "The Tamil new year is called Puthandu and falls in April."),
+]
+
+tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL)
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
+
+
+# ------------------------------------------------------------------ helpers
+def ask_input(prompt, default, cast=str):
+    raw = input(f"{prompt} [{default}]: ").strip()
+    if not raw:
+        return default
+    try:
+        return cast(raw)
+    except ValueError:
+        print(f"  Invalid value, using default {default}")
+        return default
+
+
+def in_colab():
+    try:
+        import google.colab  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def get_dataset_path():
+    if in_colab():
+        p = input("Text file path (Enter = open upload dialog): ").strip().strip('"')
+        if p and os.path.isfile(p):
+            return p
+        if p:
+            if "\\" in p or re.match(r"^[A-Za-z]:", p):
+                print("That is a path on your own computer. Colab runs online and cannot see it.")
+            elif os.path.isdir(p):
+                print("That is a folder, not a file.")
+            else:
+                print(f"File not found: {p}")
+            print("Opening the upload dialog instead - pick your .txt file from your computer.")
+        from google.colab import files
+        print("Choose your .txt file (cancel to use the sample data)...")
+        uploaded = files.upload()
+        return next(iter(uploaded)) if uploaded else None
+    p = input("Text file path (Enter = use built-in sample data): ").strip().strip('"')
+    return p or None
+
+
+Q_LINE = re.compile(r"^(?:\d+[.)]\s*)?(?:q|question)\s*:\s*(.*)$", re.IGNORECASE)
+A_LINE = re.compile(r"^(?:a|answer)\s*:\s*(.*)$", re.IGNORECASE)
+
+
+def parse_text(text):
+    """Turn 'Q: ... / A: ...' text into a list of {question, answer} examples."""
+    examples, q, a, current = [], None, None, None
+
+    def flush():
+        if q and a:
+            examples.append({"question": " ".join(q).strip(), "answer": " ".join(a).strip()})
+
+    for line in text.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        m_q, m_a = Q_LINE.match(s), A_LINE.match(s)
+        if m_q:
+            flush()
+            q, a, current = [m_q.group(1)], None, "q"
+        elif m_a and q is not None:
+            a, current = [m_a.group(1)], "a"
+        elif current == "q":
+            q.append(s)
+        elif current == "a":
+            a.append(s)
+    flush()
+    return [e for e in examples if e["question"] and e["answer"]]
+
+
+def load_examples(path):
+    if os.path.isdir(path):
+        raise ValueError("that is a folder, not a file. Give the full path to your .txt file.")
+    if not os.path.exists(path):
+        raise ValueError("file not found. Check the path (in Colab, upload the file first).")
+    if not path.lower().endswith((".txt", ".md")):
+        raise ValueError("Please use a plain text file (.txt).")
+    with open(path, encoding="utf-8", errors="ignore") as fh:
+        examples = parse_text(fh.read())
+    if not examples:
+        raise ValueError(
+            "no Q:/A: pairs found. Write each example like:\n"
+            "    Q: your question\n    A: the answer you want"
+        )
+    return examples
+
+
+def split_examples(examples):
+    examples = examples[:]
+    random.Random(42).shuffle(examples)
+    if len(examples) >= 10:
+        n_eval = min(20, max(1, round(0.1 * len(examples))))
+        return examples[n_eval:], examples[:n_eval], "held-out"
+    return examples, examples, "same-as-training"
+
+
+def to_text(ex):
+    messages = [
+        {"role": "user", "content": ex["question"]},
+        {"role": "assistant", "content": ex["answer"]},
+    ]
+    return {"text": tokenizer.apply_chat_template(messages, tokenize=False)}
+
+
+def tokenize(ex):
+    return tokenizer(ex["text"], truncation=True, max_length=512)
+
+
+def build_dataset(examples):
+    ds = Dataset.from_list(examples).map(to_text)
+    return ds.map(tokenize, remove_columns=ds.column_names)
+
+
+def load_base_model():
+    try:
+        return AutoModelForCausalLM.from_pretrained(BASE_MODEL, dtype=torch.float32)
+    except TypeError:  # older transformers
+        return AutoModelForCausalLM.from_pretrained(BASE_MODEL, torch_dtype=torch.float32)
+
+
+def generate(model, question, max_new_tokens=150):
+    model.eval()
+    inputs = tokenizer.apply_chat_template(
+        [{"role": "user", "content": question}],
+        add_generation_prompt=True,
+        return_tensors="pt",
+        return_dict=True,
+    ).to(model.device)
+    with torch.no_grad():
+        out = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            pad_token_id=tokenizer.pad_token_id,
+        )
+    return tokenizer.decode(out[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True).strip()
+
+
+def token_f1(pred, ref):
+    p, r = re.findall(r"\w+", pred.lower()), re.findall(r"\w+", ref.lower())
+    common = sum((Counter(p) & Counter(r)).values())
+    if not p or not r or common == 0:
+        return 0.0
+    precision, recall = common / len(p), common / len(r)
+    return 2 * precision * recall / (precision + recall)
+
+
+def measure(model, trainer, eval_examples):
+    """The stats checker: eval loss, perplexity, and answer-match score (token F1)."""
+    loss = trainer.evaluate()["eval_loss"]
+    scores = [
+        token_f1(generate(model, ex["question"], 80), ex["answer"])
+        for ex in eval_examples[:MAX_GEN_EVAL]
+    ]
+    return {"loss": loss, "ppl": math.exp(min(loss, 20)), "f1": sum(scores) / len(scores)}
+
+
+def gpu_name():
+    return torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU only"
+
+
+def save_loss_curve(log_history):
+    points = [(l["step"], l["loss"]) for l in log_history if "loss" in l]
+    if not points:
+        return None
+    try:
+        import matplotlib.pyplot as plt
+        plt.figure(figsize=(6, 3.5))
+        plt.plot([p[0] for p in points], [p[1] for p in points], marker="o")
+        plt.xlabel("Training step")
+        plt.ylabel("Training loss")
+        plt.title("Loss curve")
+        plt.grid(alpha=0.3)
+        plt.tight_layout()
+        plt.savefig("loss_curve.png", dpi=120)
+        if in_colab():
+            plt.show()
+        plt.close()
+        return "loss_curve.png"
+    except Exception as e:  # matplotlib missing etc.
+        print(f"(Could not draw loss curve: {e})")
+        return None
+
+
+def make_report(info, before, after, log_history):
+    losses = [l["loss"] for l in log_history if "loss" in l]
+    lines = [
+        "=" * 58,
+        "                 FINE-TUNING STATS REPORT",
+        "=" * 58,
+        f"Dataset            : {info['source']}",
+        f"Examples           : {info['n_train']} train / {info['n_eval']} eval ({info['eval_kind']})",
+        f"Settings           : {info['epochs']} epochs, lr {info['lr']}, batch {info['batch']}, LoRA rank {info['rank']}",
+        f"Trainable params   : {info['trainable']:,} of {info['total']:,} ({100 * info['trainable'] / info['total']:.2f}%)",
+        f"Training time      : {info['seconds']:.1f} s on {gpu_name()}",
+    ]
+    if losses:
+        lines.append(f"Training loss      : {losses[0]:.3f} -> {losses[-1]:.3f}")
+    lines += [
+        "-" * 58,
+        f"{'Metric':<24}{'Before':>12}{'After':>12}{'Change':>10}",
+        f"{'Eval loss (lower=better)':<24}{before['loss']:>12.3f}{after['loss']:>12.3f}{after['loss'] - before['loss']:>+10.3f}",
+        f"{'Perplexity (lower=better)':<24}{before['ppl']:>12.2f}{after['ppl']:>12.2f}{after['ppl'] - before['ppl']:>+10.2f}",
+        f"{'Answer match F1 (0-1)':<24}{before['f1']:>12.3f}{after['f1']:>12.3f}{after['f1'] - before['f1']:>+10.3f}",
+        "=" * 58,
+    ]
+    if info["eval_kind"] == "same-as-training":
+        lines.append("Note: fewer than 10 examples, so the eval used the training data.")
+        lines.append("      Add 10+ examples for a fair before/after check.")
+    return "\n".join(lines)
+
+
+# ------------------------------------------------------------------ main flow
+def run_once():
+    print("\n=== Step 1: your text file ===")
+    path = get_dataset_path()
+    examples, source = None, "built-in sample data"
+    if path:
+        try:
+            examples, source = load_examples(path), path
+        except Exception as e:
+            print(f"Could not use '{path}': {e}\nUsing the built-in sample data instead.")
+    if examples is None:
+        examples = [{"question": q, "answer": a} for q, a in SAMPLE]
+    train_ex, eval_ex, eval_kind = split_examples(examples)
+    print(f"Loaded {len(examples)} Q&A examples from {source}.")
+
+    print("\n=== Step 2: settings (press Enter to keep the default) ===")
+    epochs = ask_input("Epochs", 3, int)
+    lr = ask_input("Learning rate", 2e-4, float)
+    batch = ask_input("Batch size", 2, int)
+    rank = ask_input("LoRA rank", 8, int)
+
+    print("\n=== Step 3: loading model and preparing LoRA ===")
+    model = load_base_model()
+    model = get_peft_model(
+        model,
+        LoraConfig(
+            r=rank,
+            lora_alpha=rank * 2,
+            lora_dropout=0.05,
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+            task_type="CAUSAL_LM",
+        ),
+    )
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in model.parameters())
+
+    steps_per_epoch = math.ceil(len(train_ex) / batch)
+    logging_steps = max(1, (steps_per_epoch * epochs) // 20)
+
+    trainer = Trainer(
+        model=model,
+        args=TrainingArguments(
+            output_dir=OUTPUT_DIR,
+            per_device_train_batch_size=batch,
+            per_device_eval_batch_size=batch,
+            num_train_epochs=epochs,
+            learning_rate=lr,
+            logging_steps=logging_steps,
+            save_strategy="no",
+            report_to="none",
+        ),
+        train_dataset=build_dataset(train_ex),
+        eval_dataset=build_dataset(eval_ex),
+        data_collator=DataCollatorForLanguageModeling(tokenizer, mlm=False),
+    )
+
+    print("\n=== Step 4: measuring BEFORE training ===")
+    before = measure(model, trainer, eval_ex)
+    print(f"Before -> loss {before['loss']:.3f}, perplexity {before['ppl']:.2f}, F1 {before['f1']:.3f}")
+
+    print("\n=== Step 5: training ===")
+    start = time.time()
+    trainer.train()
+    seconds = time.time() - start
+
+    print("\n=== Step 6: measuring AFTER training ===")
+    after = measure(model, trainer, eval_ex)
+
+    model.save_pretrained(OUTPUT_DIR)
+    tokenizer.save_pretrained(OUTPUT_DIR)
+
+    info = {
+        "source": source, "n_train": len(train_ex), "n_eval": len(eval_ex),
+        "eval_kind": eval_kind, "epochs": epochs, "lr": lr, "batch": batch,
+        "rank": rank, "trainable": trainable, "total": total, "seconds": seconds,
+    }
+    report = make_report(info, before, after, trainer.state.log_history)
+    print("\n" + report)
+    curve = save_loss_curve(trainer.state.log_history)
+    print(f"\nAdapter saved in ./{OUTPUT_DIR}" + (f" | loss curve saved as {curve}" if curve else ""))
+
+    chat_loop(model, report)
+
+
+def chat_loop(model, report):
+    compare = False
+    print("\n=== Test your fine-tuned model ===")
+    print("Type a question. Commands:  stats = show report again | "
+          "compare = toggle base-vs-fine-tuned answers | quit = finish")
+    while True:
+        q = input("\nYou: ").strip()
+        if not q:
+            continue
+        low = q.lower()
+        if low in {"quit", "exit"}:
+            break
+        if low == "stats":
+            print(report)
+            continue
+        if low == "compare":
+            compare = not compare
+            print(f"Compare mode {'ON' if compare else 'OFF'}.")
+            continue
+        print("Fine-tuned:", generate(model, q, 200))
+        if compare:
+            with model.disable_adapter():
+                print("Base model:", generate(model, q, 200))
+
+
+if __name__ == "__main__":
+    while True:
+        run_once()
+        again = input("\nTrain again with new settings or data? (y/n) [n]: ").strip().lower()
+        if again != "y":
+            print("Done.")
+            break
